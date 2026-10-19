@@ -1,0 +1,6 @@
+apiVersion: v2
+name: university-moteur
+description: Safety Verification Engine - vérifie les actions de remédiation proposées par le décideur avant de les exécuter
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

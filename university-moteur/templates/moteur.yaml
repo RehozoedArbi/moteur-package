@@ -1,0 +1,244 @@
+# Moteur de vérification de sûreté : ServiceAccount, droits (RBAC), Deployment, NetworkPolicy.
+# Le namespace de déploiement est celui de la release (helm -n university-moteur).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: moteur
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: moteur
+    app.kubernetes.io/part-of: university-moteur
+---
+# Droits dans l'application : lire et modifier UNIQUEMENT les Deployments suivis,
+# lire leurs HPA. Aucun accès aux secrets, aux pods ni aux autres ressources.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: moteur
+  namespace: {{ .Values.appNamespace }}
+  labels:
+    app.kubernetes.io/name: moteur
+    app.kubernetes.io/part-of: university-moteur
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames:
+      {{- range $svc := .Values.watchedServices }}
+      - {{ $svc }}
+      {{- end }}
+    verbs: ["get", "patch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    resourceNames:
+      {{- range $svc := .Values.watchedServices }}
+      - {{ $svc }}
+      {{- end }}
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: moteur
+  namespace: {{ .Values.appNamespace }}
+  labels:
+    app.kubernetes.io/name: moteur
+    app.kubernetes.io/part-of: university-moteur
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: moteur
+subjects:
+  - kind: ServiceAccount
+    name: moteur
+    namespace: {{ .Release.Namespace }}
+---
+# Droits dans le namespace du décideur : lire ses logs (les propositions), rien d'autre.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: moteur-lecture-decideur
+  namespace: {{ .Values.decideurNamespace }}
+  labels:
+    app.kubernetes.io/name: moteur
+    app.kubernetes.io/part-of: university-moteur
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: moteur-lecture-decideur
+  namespace: {{ .Values.decideurNamespace }}
+  labels:
+    app.kubernetes.io/name: moteur
+    app.kubernetes.io/part-of: university-moteur
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: moteur-lecture-decideur
+subjects:
+  - kind: ServiceAccount
+    name: moteur
+    namespace: {{ .Release.Namespace }}
+---
+# Un seul réplica, stratégie Recreate : jamais deux moteurs en même temps (double exécution).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moteur
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: moteur
+    app.kubernetes.io/part-of: university-moteur
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: moteur
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: moteur
+        app.kubernetes.io/part-of: university-moteur
+    spec:
+      serviceAccountName: moteur
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: moteur
+          image: "{{ .Values.image.registry }}/{{ .Values.image.name }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: DRY_RUN
+              value: {{ .Values.config.dryRun | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            - name: POLL_INTERVAL_SECONDS
+              value: {{ .Values.config.pollIntervalSeconds | quote }}
+            - name: MAX_PROPOSAL_AGE_SECONDS
+              value: {{ .Values.config.maxProposalAgeSeconds | quote }}
+            - name: FLAPPING_WINDOW_SECONDS
+              value: {{ .Values.config.flappingWindowSeconds | quote }}
+            - name: PROMETHEUS_URL
+              value: {{ .Values.config.prometheusUrl | quote }}
+            - name: APP_NAMESPACE
+              value: {{ .Values.appNamespace | quote }}
+            - name: DECIDEUR_NAMESPACE
+              value: {{ .Values.decideurNamespace | quote }}
+            - name: DECIDEUR_LABEL
+              value: {{ .Values.decideurLabel | quote }}
+            - name: DB_HOST
+              value: {{ .Values.database.host | quote }}
+            - name: DB_PORT
+              value: {{ .Values.database.port | quote }}
+            - name: DB_NAME
+              value: {{ .Values.database.name | quote }}
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.userKey }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.passwordKey }}
+            - name: HEARTBEAT_FILE
+              value: /tmp/moteur-heartbeat
+            {{- range $name, $value := .Values.extraEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # Le moteur touche /tmp/moteur-heartbeat à chaque cycle : si la boucle se fige, redémarrage.
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, sys, time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/moteur-heartbeat') < 120 else 1)"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+{{- if .Values.networkPolicy.enabled }}
+---
+# Aucune entrée ; sorties limitées au DNS, à Prometheus, à Postgres et à l'API Kubernetes.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: moteur
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: moteur
+    app.kubernetes.io/part-of: university-moteur
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: moteur
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.prometheusPort }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.appNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.postgresPort }}
+    - to:
+        {{- range $cidr := .Values.networkPolicy.apiServerCidrs }}
+        - ipBlock:
+            cidr: {{ $cidr }}
+        {{- end }}
+      ports:
+        {{- range $port := .Values.networkPolicy.apiServerPorts }}
+        - protocol: TCP
+          port: {{ $port }}
+        {{- end }}
+{{- end }}

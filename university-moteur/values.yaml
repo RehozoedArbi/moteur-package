@@ -1,0 +1,60 @@
+# Le moteur est déployé dans le namespace de la release (helm upgrade --install -n university-moteur).
+# Ce namespace est créé par scripts/setup-moteur.sh, pas par le chart.
+
+appNamespace: university-app          # là où le moteur agit
+decideurNamespace: university-decideur  # là où il lit les propositions
+decideurLabel: app.kubernetes.io/name=decideur
+
+# Deployments que le moteur a le droit de lire et de modifier (et HPA du même nom)
+watchedServices:
+  - student-service
+  - enrollment-service
+  - teacher-admin-service
+
+image:
+  registry: docker.io/darbi
+  name: university-moteur
+  tag: "0.1.0"          # changer le tag à chaque nouvelle image
+  pullPolicy: IfNotPresent
+
+config:
+  dryRun: "true"        # "false" : le moteur AGIT réellement (restart, scale, rollback)
+  logLevel: INFO
+  pollIntervalSeconds: "10"
+  maxProposalAgeSeconds: "120"
+  flappingWindowSeconds: "120"
+  prometheusUrl: http://prometheus.monitoring.svc.cluster.local:9090
+
+# Seuils avancés (voir moteur.py, classe Config) : BASELINE_MIN_SAMPLES, DB_MIN_CLIENTS, ...
+extraEnv: {}
+
+database:
+  # Rôle Postgres en LECTURE SEULE (créé par setup_engine_db.sh), identifiants dans un Secret
+  # créé par scripts/setup-moteur.sh : jamais dans ce fichier ni dans l'historique Helm.
+  host: postgres.university-app.svc.cluster.local
+  port: "5432"
+  name: university_db
+  existingSecret: moteur-db
+  userKey: username
+  passwordKey: password
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+networkPolicy:
+  enabled: true
+  monitoringNamespace: monitoring
+  prometheusPort: 9090
+  postgresPort: 5432
+  # Adresses de l'API Kubernetes. 0.0.0.0/0 sur les ports ci-dessous est large : pour resserrer,
+  # remplacer par l'IP du nœud (kubectl get endpoints kubernetes -n default).
+  apiServerCidrs:
+    - 0.0.0.0/0
+  apiServerPorts:
+    - 443
+    - 6443
